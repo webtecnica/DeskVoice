@@ -264,10 +264,21 @@ export class AsteriskCalls {
     return true;
   }
 
-  /** A discagem da transferência mudou de estado (evento `Dial` da ARI, com o canal de quem ligou em `caller`). */
-  transferDialed(channelId: string, dialStatus: string): void {
+  /**
+   * A discagem da transferência mudou de estado (evento `Dial` da ARI, com o canal de quem ligou em `caller`).
+   *
+   * O `ANSWER` é o instante em que a pessoa da equipe atende: ali a conversa com a IA acabou. O
+   * `transfer_completed` com `answered: true` é gravado já neste evento, e não no fim do canal, porque é
+   * esse fato que devolve a vaga do teto de ligações recebidas (`inboundLimitReached`) enquanto a pessoa
+   * fala — sem ele, a ligação seguinte recebia ocupado durante toda a conversa com ela. A linha da
+   * ligação continua `in_progress` e sem `ended_at`: o canal está de pé, e o `finish` roda uma vez no fim
+   * dele (contrato 3). O `reportTransfer` do fim do canal vira no-op (`transferReported`).
+   */
+  async transferDialed(channelId: string, dialStatus: string): Promise<void> {
     const call = this.byChannel.get(channelId);
-    if (call?.transferTo && dialStatus === "ANSWER") call.transferAnswered = true;
+    if (!call?.transferTo || dialStatus !== "ANSWER") return;
+    call.transferAnswered = true;
+    await this.reportTransfer(call, "ANSWER");
   }
 
   /** O canal deixou de existir. */

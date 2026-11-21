@@ -80,6 +80,9 @@ const NOTICE: Record<Refusal, (dialed: string, limit: number) => string> = {
  * Conversas e recados contam cada um no seu (decisão 0018, escolha 3A): o recado não gasta IA e não
  * tira a vaga de uma conversa, e os recados ao mesmo tempo têm o mesmo número como limite próprio,
  * para uma rajada para um número sem agente não abrir um canal de áudio e um arquivo por chamada.
+ *
+ * A conversa cuja transferência foi atendida não conta: quem fala é a pessoa da equipe, e a vaga volta
+ * para a próxima ligação enquanto o canal dela continua de pé (o porquê está no comentário da consulta).
  */
 export async function inboundLimitReached(q: OrgQuery, clock: Clock, kind: "conversation" | "voicemail" = "conversation"): Promise<{ reached: boolean; limit: number }> {
   // Tranca a linha da organização até a transação confirmar: duas ligações que chegam juntas
@@ -96,13 +99,25 @@ export async function inboundLimitReached(q: OrgQuery, clock: Clock, kind: "conv
   // ocupado a toda ligação até alguém reiniciar o processo de voz.
   // O recado não tem agente que o limite: a vida dele vem do próprio recado, o atendimento e o aviso
   // mais o maior tempo máximo que o operador pode gravar.
+  //
+  // A vaga é da conversa com a IA. A ligação cuja transferência foi atendida não é mais uma conversa
+  // nossa: quem fala é a pessoa da equipe, e o `transfer_completed` com `answered: true` é esse fato,
+  // gravado no evento `Dial` (`asterisk-transport.ts`). A linha continua `in_progress` e sem `ended_at`
+  // até o canal cair — a ligação está de pé e o `finish` roda uma vez no fim dela —, mas ela não segura
+  // vaga: senão, com o limite em 1, a próxima ligação recebia ocupado durante toda a conversa com a
+  // pessoa. O trecho de volta não entra nisso: ele é uma conversa com a IA outra vez, e a transferência
+  // não atendida grava `answered: false`.
   const longest =
     kind === "voicemail"
       ? BEFORE_MESSAGE_MS / 1000 + MAX_VOICEMAIL_SECONDS
       : ((await q.one<{ seconds: number }>("select coalesce(max(max_call_seconds), 600)::int as seconds from agents where organization_id = $1", [q.organizationId]))?.seconds ?? 600);
   const alive = new Date(clock.now().getTime() - (longest + STUCK_CALL_SLACK_SECONDS) * 1000);
   const active = await q.one<{ count: number }>(
-    "select count(*)::int as count from calls where organization_id = $1 and direction = 'inbound' and to_e164 is not null and status in ('ringing', 'in_progress') and started_at > $2 and voicemail = $3",
+    `select count(*)::int as count from calls c
+      where c.organization_id = $1 and c.direction = 'inbound' and c.to_e164 is not null and c.status in ('ringing', 'in_progress') and c.started_at > $2 and c.voicemail = $3
+        and not exists (
+          select 1 from call_events e where e.call_id = c.id and e.kind = 'transfer_completed' and e.payload->>'answered' = 'true'
+        )`,
     [q.organizationId, alive, kind === "voicemail"],
   );
   return { reached: (active?.count ?? 0) >= limit, limit };
